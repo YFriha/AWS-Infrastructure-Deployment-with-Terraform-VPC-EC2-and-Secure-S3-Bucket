@@ -39,9 +39,13 @@ It creates a custom VPC with public subnet, an EC2 instance, and a securely conf
    terraform init
 Review the planned infrastructure changes:
 terraform plan
+
 Apply the changes to provision infrastructure:
+
 terraform apply
+
 After the deployment, use the output SSH command to connect to your EC2 instance:
+
 ssh -i ~/.ssh/mykey ec2-user@<instance_public_ip>
 To destroy all resources when done:
 terraform destroy
