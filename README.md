@@ -38,28 +38,12 @@ It creates a custom VPC with public subnet, an EC2 instance, and a securely conf
    ```bash
    terraform init
 Review the planned infrastructure changes:
-
-bash
-Copy
-Edit
 terraform plan
 Apply the changes to provision infrastructure:
-
-bash
-Copy
-Edit
 terraform apply
 After the deployment, use the output SSH command to connect to your EC2 instance:
-
-bash
-Copy
-Edit
 ssh -i ~/.ssh/mykey ec2-user@<instance_public_ip>
 To destroy all resources when done:
-
-bash
-Copy
-Edit
 terraform destroy
 Notes
 The S3 bucket name includes a random suffix to avoid naming conflicts.
