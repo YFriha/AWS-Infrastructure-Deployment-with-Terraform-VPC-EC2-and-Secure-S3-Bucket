@@ -36,11 +36,11 @@ It creates a custom VPC with public subnet, an EC2 instance, and a securely conf
 1. Clone this repository or copy the Terraform files to your working directory.
 2. Initialize Terraform providers:
 
-   terraform init
+    terraform init
 3.Review the planned infrastructure changes:
 
     
-       terraform plan
+     terraform plan
 
 4.Apply the changes to provision infrastructure:
 
