@@ -39,8 +39,8 @@ It creates a custom VPC with public subnet, an EC2 instance, and a securely conf
    terraform init
 3.Review the planned infrastructure changes:
 
-    ```bash
-    terraform plan
+    
+       terraform plan
 
 4.Apply the changes to provision infrastructure:
 
