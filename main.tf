@@ -30,15 +30,27 @@ resource "aws_vpc" "mtc_vpc" {
   }
 }
 
-# Public Subnet
-resource "aws_subnet" "mtc_public_subnet" {
+# Public Subnet 1 (for ALB and ASG)
+resource "aws_subnet" "mtc_public_subnet_1" {
   vpc_id                  = aws_vpc.mtc_vpc.id
   cidr_block              = "10.123.1.0/24"
   map_public_ip_on_launch = true
   availability_zone       = data.aws_availability_zones.available.names[0]
 
   tags = {
-    Name = "mtc-public-subnet"
+    Name = "mtc-public-subnet-1"
+  }
+}
+
+# Public Subnet 2 (ALB requires at least 2 AZs)
+resource "aws_subnet" "mtc_public_subnet_2" {
+  vpc_id                  = aws_vpc.mtc_vpc.id
+  cidr_block              = "10.123.2.0/24"
+  map_public_ip_on_launch = true
+  availability_zone       = data.aws_availability_zones.available.names[1]
+
+  tags = {
+    Name = "mtc-public-subnet-2"
   }
 }
 
@@ -67,28 +79,24 @@ resource "aws_route" "default_route" {
   gateway_id             = aws_internet_gateway.mtc_igw.id
 }
 
-# Route Table Association
-resource "aws_route_table_association" "public_assoc" {
-  subnet_id      = aws_subnet.mtc_public_subnet.id
+# Route Table Associations
+resource "aws_route_table_association" "public_assoc_1" {
+  subnet_id      = aws_subnet.mtc_public_subnet_1.id
   route_table_id = aws_route_table.public.id
 }
 
-# Security Group with Restricted Access
-resource "aws_security_group" "mtc_sg" {
-  name        = "mtc-public-sg"
-  description = "Security group for public instances"
+resource "aws_route_table_association" "public_assoc_2" {
+  subnet_id      = aws_subnet.mtc_public_subnet_2.id
+  route_table_id = aws_route_table.public.id
+}
+
+# Security Group for ALB
+resource "aws_security_group" "mtc_alb_sg" {
+  name        = "mtc-alb-sg"
+  description = "Security group for Application Load Balancer"
   vpc_id      = aws_vpc.mtc_vpc.id
 
-  # SSH access (more secure - restrict to your IP)
-  ingress {
-    description = "SSH"
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"] 
-  }
-
-  # HTTP access
+  # HTTP access from internet
   ingress {
     description = "HTTP"
     from_port   = 80
@@ -97,7 +105,7 @@ resource "aws_security_group" "mtc_sg" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  # HTTPS access
+  # HTTPS access from internet
   ingress {
     description = "HTTPS"
     from_port   = 443
@@ -115,7 +123,44 @@ resource "aws_security_group" "mtc_sg" {
   }
 
   tags = {
-    Name = "mtc-security-group"
+    Name = "mtc-alb-security-group"
+  }
+}
+
+# Security Group for EC2 instances (updated for ASG)
+resource "aws_security_group" "mtc_instance_sg" {
+  name        = "mtc-instance-sg"
+  description = "Security group for EC2 instances in ASG"
+  vpc_id      = aws_vpc.mtc_vpc.id
+
+  # SSH access (restrict to your IP for security)
+  ingress {
+    description = "SSH"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"] # Consider restricting this to your IP
+  }
+
+  # HTTP access from ALB only
+  ingress {
+    description     = "HTTP from ALB"
+    from_port       = 80
+    to_port         = 80
+    protocol        = "tcp"
+    security_groups = [aws_security_group.mtc_alb_sg.id]
+  }
+
+  # All outbound traffic
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "mtc-instance-security-group"
   }
 }
 
@@ -129,13 +174,200 @@ resource "aws_key_pair" "mtc_auth" {
   }
 }
 
-# EC2 Instance
+# Launch Template for Auto Scaling Group
+resource "aws_launch_template" "mtc_launch_template" {
+  name_prefix   = "mtc-launch-template-"
+  description   = "Launch template for MTC Auto Scaling Group"
+  image_id      = data.aws_ami.server_ami.id
+  instance_type = "t3.micro"
+  key_name      = aws_key_pair.mtc_auth.key_name
+
+  vpc_security_group_ids = [aws_security_group.mtc_instance_sg.id]
+
+  user_data = base64encode(file("userdata.tpl"))
+
+  block_device_mappings {
+    device_name = "/dev/xvda"
+    ebs {
+      volume_size = 8
+      volume_type = "gp3"
+      encrypted   = true
+    }
+  }
+
+  tag_specifications {
+    resource_type = "instance"
+    tags = {
+      Name = "mtc-asg-instance"
+    }
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+
+  tags = {
+    Name = "mtc-launch-template"
+  }
+}
+
+# Application Load Balancer
+resource "aws_lb" "mtc_alb" {
+  name               = "mtc-application-lb"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.mtc_alb_sg.id]
+  subnets           = [
+    aws_subnet.mtc_public_subnet_1.id,
+    aws_subnet.mtc_public_subnet_2.id
+  ]
+
+  enable_deletion_protection = false
+
+  tags = {
+    Name = "mtc-application-load-balancer"
+  }
+}
+
+# ALB Target Group
+resource "aws_lb_target_group" "mtc_tg" {
+  name     = "mtc-target-group"
+  port     = 80
+  protocol = "HTTP"
+  vpc_id   = aws_vpc.mtc_vpc.id
+
+  health_check {
+    enabled             = true
+    healthy_threshold   = 2
+    interval            = 30
+    matcher             = "200"
+    path                = "/"
+    port                = "traffic-port"
+    protocol            = "HTTP"
+    timeout             = 5
+    unhealthy_threshold = 2
+  }
+
+  tags = {
+    Name = "mtc-target-group"
+  }
+}
+
+# ALB Listener
+resource "aws_lb_listener" "mtc_listener" {
+  load_balancer_arn = aws_lb.mtc_alb.arn
+  port              = "80"
+  protocol          = "HTTP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.mtc_tg.arn
+  }
+
+  tags = {
+    Name = "mtc-alb-listener"
+  }
+}
+
+# Auto Scaling Group
+resource "aws_autoscaling_group" "mtc_asg" {
+  name                = "mtc-auto-scaling-group"
+  vpc_zone_identifier = [
+    aws_subnet.mtc_public_subnet_1.id,
+    aws_subnet.mtc_public_subnet_2.id
+  ]
+  target_group_arns   = [aws_lb_target_group.mtc_tg.arn]
+  health_check_type   = "ELB"
+  health_check_grace_period = 300
+
+  min_size         = 1
+  max_size         = 4
+  desired_capacity = 2
+
+  launch_template {
+    id      = aws_launch_template.mtc_launch_template.id
+    version = "$Latest"
+  }
+
+  # Instance refresh configuration
+  instance_refresh {
+    strategy = "Rolling"
+    preferences {
+      min_healthy_percentage = 50
+    }
+  }
+
+  tag {
+    key                 = "Name"
+    value               = "mtc-asg-instance"
+    propagate_at_launch = true
+  }
+
+  tag {
+    key                 = "Environment"
+    value               = "dev"
+    propagate_at_launch = true
+  }
+}
+
+# Auto Scaling Policies
+resource "aws_autoscaling_policy" "mtc_scale_up" {
+  name                   = "mtc-scale-up"
+  scaling_adjustment     = 1
+  adjustment_type        = "ChangeInCapacity"
+  cooldown               = 300
+  autoscaling_group_name = aws_autoscaling_group.mtc_asg.name
+}
+
+resource "aws_autoscaling_policy" "mtc_scale_down" {
+  name                   = "mtc-scale-down"
+  scaling_adjustment     = -1
+  adjustment_type        = "ChangeInCapacity"
+  cooldown               = 300
+  autoscaling_group_name = aws_autoscaling_group.mtc_asg.name
+}
+
+# CloudWatch Alarms for Auto Scaling
+resource "aws_cloudwatch_metric_alarm" "mtc_cpu_high" {
+  alarm_name          = "mtc-cpu-utilization-high"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = "2"
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = "120"
+  statistic           = "Average"
+  threshold           = "70"
+  alarm_description   = "This metric monitors ec2 cpu utilization"
+  alarm_actions       = [aws_autoscaling_policy.mtc_scale_up.arn]
+
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.mtc_asg.name
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "mtc_cpu_low" {
+  alarm_name          = "mtc-cpu-utilization-low"
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = "2"
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = "120"
+  statistic           = "Average"
+  threshold           = "30"
+  alarm_description   = "This metric monitors ec2 cpu utilization"
+  alarm_actions       = [aws_autoscaling_policy.mtc_scale_down.arn]
+
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.mtc_asg.name
+  }
+}
+
 resource "aws_instance" "dev_node" {
   instance_type          = "t3.micro"
   ami                    = data.aws_ami.server_ami.id
   # key_name               = aws_key_pair.mtc_auth.key_name
-  vpc_security_group_ids = [aws_security_group.mtc_sg.id]
-  subnet_id              = aws_subnet.mtc_public_subnet.id
+  vpc_security_group_ids = [aws_security_group.mtc_instance_sg.id]
+  subnet_id              = aws_subnet.mtc_public_subnet_1.id
   user_data              = file("userdata.tpl")
 
   root_block_device {
@@ -145,7 +377,7 @@ resource "aws_instance" "dev_node" {
   }
 
   tags = {
-    Name = "mtc-dev-node2"
+    Name = "mtc-dev-node-standalone"
   }
 
   provisioner "local-exec" {
@@ -235,18 +467,43 @@ output "vpc_id" {
   value       = aws_vpc.mtc_vpc.id
 }
 
-output "public_subnet_id" {
-  description = "ID of the public subnet"
-  value       = aws_subnet.mtc_public_subnet.id
+output "public_subnet_1_id" {
+  description = "ID of the first public subnet"
+  value       = aws_subnet.mtc_public_subnet_1.id
+}
+
+output "public_subnet_2_id" {
+  description = "ID of the second public subnet"
+  value       = aws_subnet.mtc_public_subnet_2.id
+}
+
+output "alb_dns_name" {
+  description = "DNS name of the Application Load Balancer"
+  value       = aws_lb.mtc_alb.dns_name
+}
+
+output "alb_zone_id" {
+  description = "Zone ID of the Application Load Balancer"
+  value       = aws_lb.mtc_alb.zone_id
+}
+
+output "asg_name" {
+  description = "Name of the Auto Scaling Group"
+  value       = aws_autoscaling_group.mtc_asg.name
+}
+
+output "launch_template_id" {
+  description = "ID of the Launch Template"
+  value       = aws_launch_template.mtc_launch_template.id
 }
 
 output "instance_id" {
-  description = "ID of the EC2 instance"
+  description = "ID of the standalone EC2 instance"
   value       = aws_instance.dev_node.id
 }
 
 output "instance_public_ip" {
-  description = "Public IP address of the EC2 instance"
+  description = "Public IP address of the standalone EC2 instance"
   value       = aws_instance.dev_node.public_ip
 }
 
@@ -260,7 +517,12 @@ output "bucket_arn" {
   value       = aws_s3_bucket.mtc_bucket.arn
 }
 
-output "ssh_command" {
-  description = "SSH command to connect to the instance"
+output "ssh_command_standalone" {
+  description = "SSH command to connect to the standalone instance"
   value       = "ssh -i ~/.ssh/mykey ec2-user@${aws_instance.dev_node.public_ip}"
+}
+
+output "application_url" {
+  description = "URL to access the application via ALB"
+  value       = "http://${aws_lb.mtc_alb.dns_name}"
 }
